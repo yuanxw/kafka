@@ -183,6 +183,7 @@ public class NetworkClient implements KafkaClient {
 
         if (connectionStates.canConnect(node.idString(), now))
             // if we are interested in sending to a node and we don't have a connection to it, initiate one
+            // 初始化网络连接
             initiateConnect(node, now);
 
         return false;
@@ -344,14 +345,15 @@ public class NetworkClient implements KafkaClient {
      */
     @Override
     public List<ClientResponse> poll(long timeout, long now) {
+        // 封装要拉取元数据的请求
         long metadataTimeout = metadataUpdater.maybeUpdate(now);
         try {
             this.selector.poll(Utils.min(timeout, metadataTimeout, requestTimeoutMs));
         } catch (IOException e) {
             log.error("Unexpected error during I/O", e);
         }
-
         // process completed actions
+        // 处理已完成请求的操作
         long updatedNow = this.time.milliseconds();
         List<ClientResponse> responses = new ArrayList<>();
         handleAbortedSends(responses);
@@ -413,6 +415,10 @@ public class NetworkClient implements KafkaClient {
      * existing connection and from which we have disconnected within the reconnect backoff period.
      *
      * @return The node with the fewest in-flight requests.
+     *
+     * 选择未完成请求最少且至少符合连接条件的节点。此方法将首选具有现有连接的节点，但可能会选择我们还没有
+     * 连接 （如果所有现有连接都在使用中）。此方法永远不会选择没有现有连接，并且我们在 Reconnect 回退期内已断开连接。
+     * 正在进行的请求最少的节点。
      */
     @Override
     public Node leastLoadedNode(long now) {
@@ -619,13 +625,15 @@ public class NetworkClient implements KafkaClient {
     }
 
     /**
-     * Initiate a connection to the given node
+     * 初始化连接，如果连接失败，则会尝试重试。
      */
     private void initiateConnect(Node node, long now) {
         String nodeConnectionId = node.idString();
         try {
             log.debug("Initiating connection to node {} at {}:{}.", node.id(), node.host(), node.port());
+            // 修改状态为正在连接
             this.connectionStates.connecting(nodeConnectionId, now);
+            // 尝试连接
             selector.connect(nodeConnectionId,
                              new InetSocketAddress(node.host(), node.port()),
                              this.socketSendBuffer,
@@ -665,6 +673,7 @@ public class NetworkClient implements KafkaClient {
         @Override
         public long maybeUpdate(long now) {
             // should we update our metadata?
+            // 是否要更新metadata信息，当Producer线程把needUpdate设置为true时，说明需要更新metadata信息
             long timeToNextMetadataUpdate = metadata.timeToNextUpdate(now);
             long waitForMetadataFetch = this.metadataFetchInProgress ? requestTimeoutMs : 0;
 
@@ -675,6 +684,7 @@ public class NetworkClient implements KafkaClient {
 
             // Beware that the behavior of this method and the computation of timeouts for poll() are
             // highly dependent on the behavior of leastLoadedNode.
+            // 获取请求最少的Node节点
             Node node = leastLoadedNode(now);
             if (node == null) {
                 log.debug("Give up sending metadata request since no node is available");

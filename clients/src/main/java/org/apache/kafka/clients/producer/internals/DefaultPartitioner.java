@@ -52,6 +52,9 @@ public class DefaultPartitioner implements Partitioner {
      * @param cluster The current cluster metadata
      */
     public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
+        // 获得topic的分区的数量
+        // 如果没有指定key，则生成一个随机数，正整数，然后取模获得分区号。
+        // 有指定key，把key的字节数组用hash算法生成一个整数，然后取模获得分区号。
         List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
         int numPartitions = partitions.size();
         if (keyBytes == null) {

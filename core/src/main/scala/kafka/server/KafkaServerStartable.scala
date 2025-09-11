@@ -36,6 +36,7 @@ class KafkaServerStartable(val serverConfig: KafkaConfig, reporters: Seq[KafkaMe
 
   def startup() {
     try {
+      // 服务端启动
       server.startup()
     }
     catch {

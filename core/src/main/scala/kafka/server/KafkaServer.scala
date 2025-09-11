@@ -169,32 +169,40 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
   def startup() {
     try {
       info("starting")
-
+      // 状态是shutdown，不能启动，抛出异常
       if(isShuttingDown.get)
         throw new IllegalStateException("Kafka server is still shutting down, cannot re-start!")
 
+      // 已经启动完成，直接返回
       if(startupComplete.get)
         return
 
+      // 是否可以启动，cas false -> true
       val canStartup = isStartingUp.compareAndSet(false, true)
       if (canStartup) {
+        // 设置当前broker状态,启动中
         brokerState.newState(Starting)
 
         /* start scheduler */
+        // 初始化线程池
         kafkaScheduler.startup()
 
         /* setup zookeeper */
+        // 初始化zookeeper
         zkUtils = initZk()
 
         /* Get or create cluster_id */
+        // 获取或生成cluster_id集群ID
         _clusterId = getOrGenerateClusterId(zkUtils)
         info(s"Cluster ID = $clusterId")
 
         /* generate brokerId */
+        // 获取brokerId
         config.brokerId =  getBrokerId
         this.logIdent = "[Kafka Server " + config.brokerId + "], "
 
         /* create and configure metrics */
+        // 创建配置的指标监控相关的信息
         val reporters = config.getConfiguredInstances(KafkaConfig.MetricReporterClassesProp, classOf[MetricsReporter],
             Map[String, AnyRef](KafkaConfig.BrokerIdProp -> (config.brokerId.toString)).asJava)
         reporters.add(new JmxReporter(jmxPrefix))
@@ -208,18 +216,20 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         logManager = createLogManager(zkUtils.zkClient, brokerState)
         logManager.startup()
 
+        // 生成元数据缓存对象
         metadataCache = new MetadataCache(config.brokerId)
         credentialProvider = new CredentialProvider(config.saslEnabledMechanisms)
 
+        // 启动socketServer服务
         socketServer = new SocketServer(config, metrics, time, credentialProvider)
         socketServer.startup()
 
-        /* start replica manager */
+        /* 启动副本管理器ReplicaManager */
         replicaManager = new ReplicaManager(config, metrics, time, zkUtils, kafkaScheduler, logManager,
           isShuttingDown, quotaManagers.follower)
         replicaManager.startup()
 
-        /* start kafka controller */
+        /* 启动控制器KafkaController */
         kafkaController = new KafkaController(config, zkUtils, brokerState, time, metrics, threadNamePrefix)
         kafkaController.startup()
 
@@ -242,6 +252,8 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
           kafkaController, zkUtils, config.brokerId, config, metadataCache, metrics, authorizer, quotaManagers,
           clusterId, time)
 
+        // Kafka请求处理线程池
+        // 线程数为config.numIoThreads，默认为：8
         requestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.requestChannel, apis, time,
           config.numIoThreads)
 

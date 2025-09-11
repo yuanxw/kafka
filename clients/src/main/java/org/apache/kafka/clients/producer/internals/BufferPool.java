@@ -90,30 +90,38 @@ public final class BufferPool {
      *         forever)
      */
     public ByteBuffer allocate(int size, long maxTimeToBlockMs) throws InterruptedException {
+        // 申请内存大小不能超过  totalMemory默认32MB限制
         if (size > this.totalMemory)
             throw new IllegalArgumentException("Attempt to allocate " + size
                                                + " bytes, but there is a hard limit of "
                                                + this.totalMemory
                                                + " on memory allocations.");
-
+        // 加锁
         this.lock.lock();
         try {
             // check if we have a free buffer of the right size pooled
+            // 内存池中是否有符合要求的内存块，如果有，直接返回
             if (size == poolableSize && !this.free.isEmpty())
                 return this.free.pollFirst();
 
             // now check if the request is immediately satisfiable with the
             // memory on hand or if we need to block
+            // 内存池的总容量 = 内存每块大小 * 内存块数量
             int freeListSize = this.free.size() * this.poolableSize;
+            // （可用内存 + 空闲列表中的内存总和）=32M 是否大于等于申请的内存大小
             if (this.availableMemory + freeListSize >= size) {
                 // we have enough unallocated or pooled memory to immediately
                 // satisfy the request
                 freeUp(size);
+                // 扣减可用内存
                 this.availableMemory -= size;
+                // 释放锁
                 lock.unlock();
+                // 分配内存
                 return ByteBuffer.allocate(size);
             } else {
                 // we are out of memory and will have to block
+                // 统计内存分配量
                 int accumulated = 0;
                 ByteBuffer buffer = null;
                 Condition moreMemory = this.lock.newCondition();
@@ -121,11 +129,13 @@ public final class BufferPool {
                 this.waiters.addLast(moreMemory);
                 // loop over and over until we have a buffer or have reserved
                 // enough memory to allocate one
+                // 循环等待，直到有足够的内存分配给请求，或者超时
                 while (accumulated < size) {
                     long startWaitNs = time.nanoseconds();
                     long timeNs;
                     boolean waitingTimeElapsed;
                     try {
+                        // 等待，直到有足够的内存分配给请求，或者超时
                         waitingTimeElapsed = !moreMemory.await(remainingTimeToBlockNs, TimeUnit.NANOSECONDS);
                     } catch (InterruptedException e) {
                         this.waiters.remove(moreMemory);
@@ -204,12 +214,14 @@ public final class BufferPool {
     public void deallocate(ByteBuffer buffer, int size) {
         lock.lock();
         try {
+            // 如果释放的内存大小等于缓存块大小，则放入空闲列表，否则直接释放内存，加可用内存
             if (size == this.poolableSize && size == buffer.capacity()) {
                 buffer.clear();
                 this.free.add(buffer);
             } else {
                 this.availableMemory += size;
             }
+            // 唤醒等待的线程
             Condition moreMem = this.waiters.peekFirst();
             if (moreMem != null)
                 moreMem.signal();

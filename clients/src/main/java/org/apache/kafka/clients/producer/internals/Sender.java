@@ -116,11 +116,13 @@ public class Sender implements Runnable {
 
     /**
      * The main run loop for the sender thread
+     * producer线程的主 run 循环
      */
     public void run() {
         log.debug("Starting Kafka producer I/O thread.");
 
         // main loop, runs until close is called
+        // run 循环，一直运行直到调用 close
         while (running) {
             try {
                 run(time.milliseconds());
@@ -162,11 +164,12 @@ public class Sender implements Runnable {
      *            The current POSIX time in milliseconds
      */
     void run(long now) {
+        // 获取当前集群metadata信息
         Cluster cluster = metadata.fetch();
-        // get the list of partitions with data ready to send
+        // 获取已准备好发送数据的分区请求
         RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
 
-        // if there are any partitions whose leaders are not known yet, force metadata update
+        // 如果有任何分区的 leader 尚不清楚，则强制元数据更新。第一次执行topic，不会走
         if (!result.unknownLeaderTopics.isEmpty()) {
             // The set of topics with unknown leader contains topics with leader election pending as well as
             // topics which may have expired. Add the topic again to metadata to ensure it is included
@@ -175,7 +178,7 @@ public class Sender implements Runnable {
                 this.metadata.add(topic);
             this.metadata.requestUpdate();
         }
-
+        // 判断节点有没有准备好，并移除没有准备的节点
         // remove any nodes we aren't ready to send to
         Iterator<Node> iter = result.readyNodes.iterator();
         long notReadyTimeout = Long.MAX_VALUE;
@@ -188,10 +191,12 @@ public class Sender implements Runnable {
         }
 
         // create produce requests
+        // 创建批次请求
         Map<Integer, List<RecordBatch>> batches = this.accumulator.drain(cluster,
                                                                          result.readyNodes,
                                                                          this.maxRequestSize,
                                                                          now);
+        // 保证消息顺序，第一次执行guaranteeMessageOrder为false，不会走
         if (guaranteeMessageOrder) {
             // Mute all the partitions drained
             for (List<RecordBatch> batchList : batches.values()) {
@@ -200,8 +205,9 @@ public class Sender implements Runnable {
             }
         }
 
+        // 检查超时的批次，第一次执行没expiredBatches为空
         List<RecordBatch> expiredBatches = this.accumulator.abortExpiredBatches(this.requestTimeout, now);
-        // update sensors
+        // 更新超时批次的错误计数
         for (RecordBatch expiredBatch : expiredBatches)
             this.sensors.recordErrors(expiredBatch.topicPartition.topic(), expiredBatch.recordCount);
 
@@ -214,10 +220,13 @@ public class Sender implements Runnable {
         long pollTimeout = Math.min(result.nextReadyCheckDelayMs, notReadyTimeout);
         if (!result.readyNodes.isEmpty()) {
             log.trace("Nodes with data ready to send: {}", result.readyNodes);
+            // 如果有已经准备好的节点，超时间隔为0，立即发送请求
             pollTimeout = 0;
         }
+        // 准备待发送请求的数据
         sendProduceRequests(batches, now);
 
+        // 执行网络请求
         // if some partitions are already ready to be sent, the select time would be 0;
         // otherwise if some partition already has some data accumulated but not ready yet,
         // the select time will be the time difference between now and its linger expiry time;

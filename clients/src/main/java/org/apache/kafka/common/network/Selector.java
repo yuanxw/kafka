@@ -164,18 +164,25 @@ public class Selector implements Selectable {
     public void connect(String id, InetSocketAddress address, int sendBufferSize, int receiveBufferSize) throws IOException {
         if (this.channels.containsKey(id))
             throw new IllegalStateException("There is already a connection for id " + id);
-
+        // 获取SocketChannel.open()
         SocketChannel socketChannel = SocketChannel.open();
+        // 设置非阻塞模式
         socketChannel.configureBlocking(false);
+        // 获取socket
         Socket socket = socketChannel.socket();
         socket.setKeepAlive(true);
+        // 设置发送缓冲区大小、接收缓冲区大小
         if (sendBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)
             socket.setSendBufferSize(sendBufferSize);
         if (receiveBufferSize != Selectable.USE_DEFAULT_BUFFER_SIZE)
             socket.setReceiveBufferSize(receiveBufferSize);
+        // 设置TcpNoDelay属性为true，用于控制 TCP 连接中数据包的发送方式。
+        // 默认情况下，TCP 使用 Nagle 算法 来减少网络中的小数据包数量，从而提高网络利用率。
+        // 然而，这种方式可能会增加延迟，特别是在需要快速响应的应用中
         socket.setTcpNoDelay(true);
         boolean connected;
         try {
+            // 尝试连接服务器，有可能连接成功：true，也有可能连接失败:false
             connected = socketChannel.connect(address);
         } catch (UnresolvedAddressException e) {
             socketChannel.close();
@@ -184,9 +191,11 @@ public class Selector implements Selectable {
             socketChannel.close();
             throw e;
         }
+        // SocketChannel.register()注册到Selector，并设置OP_CONNECT事件
         SelectionKey key = socketChannel.register(nioSelector, SelectionKey.OP_CONNECT);
         KafkaChannel channel;
         try {
+            // 根据SocketChannel创建KafkaChannel
             channel = channelBuilder.buildChannel(id, key, maxReceiveSize);
         } catch (Exception e) {
             try {
@@ -196,13 +205,16 @@ public class Selector implements Selectable {
             }
             throw new IOException("Channel could not be created for socket " + socketChannel, e);
         }
+        // 把key和channel绑定，并设置附件为channel
         key.attach(channel);
+        // 缓存channel
         this.channels.put(id, channel);
 
         if (connected) {
             // OP_CONNECT won't trigger for immediately connected channels
             log.debug("Immediately connected to node {}", channel.id());
             immediatelyConnectedKeys.add(key);
+            // 取消前面注册的OP_CONNECT事件
             key.interestOps(0);
         }
     }
@@ -211,6 +223,14 @@ public class Selector implements Selectable {
      * Register the nioSelector with an existing channel
      * Use this on server-side, when a connection is accepted by a different thread but processed by the Selector
      * Note that we are not checking if the connection id is valid - since the connection already exists
+     */
+    /**
+     * 将socketChannel注册到nioSelector中，
+     * 并指定感兴趣的事件为OP_READ，并设置附件为KafkaChannel
+     * 缓存id和KafkaChannel的映射关系
+     * @param id
+     * @param socketChannel
+     * @throws ClosedChannelException
      */
     public void register(String id, SocketChannel socketChannel) throws ClosedChannelException {
         SelectionKey key = socketChannel.register(nioSelector, SelectionKey.OP_READ);
@@ -298,6 +318,7 @@ public class Selector implements Selectable {
         if (timeout < 0)
             throw new IllegalArgumentException("timeout should be >= 0");
 
+        // 清除先前轮询的结果
         clear();
 
         if (hasStagedReceives() || !immediatelyConnectedKeys.isEmpty())
@@ -305,11 +326,13 @@ public class Selector implements Selectable {
 
         /* check ready keys */
         long startSelect = time.nanoseconds();
+        // 返回值表示有多少连接准备好了，如果返回值大于0，则表示有连接准备好了，如果返回值等于0，则表示超时。
         int readyKeys = select(timeout);
         long endSelect = time.nanoseconds();
         this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds());
 
         if (readyKeys > 0 || !immediatelyConnectedKeys.isEmpty()) {
+            // Selector上面的key要进行处理
             pollSelectionKeys(this.nioSelector.selectedKeys(), false, endSelect);
             pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
         }
@@ -327,10 +350,12 @@ public class Selector implements Selectable {
     private void pollSelectionKeys(Iterable<SelectionKey> selectionKeys,
                                    boolean isImmediatelyConnected,
                                    long currentTimeNanos) {
+        // 遍历所有SelectionKey
         Iterator<SelectionKey> iterator = selectionKeys.iterator();
         while (iterator.hasNext()) {
             SelectionKey key = iterator.next();
             iterator.remove();
+            // 通过key获取kafkaChannel
             KafkaChannel channel = channel(key);
 
             // register all per-connection metrics at once
@@ -339,7 +364,7 @@ public class Selector implements Selectable {
                 idleExpiryManager.update(channel.id(), currentTimeNanos);
 
             try {
-
+                // 处理OP_CONNECT事件
                 /* complete any connections that have finished their handshake (either normally or immediately) */
                 if (isImmediatelyConnected || key.isConnectable()) {
                     if (channel.finishConnect()) {
@@ -461,6 +486,7 @@ public class Selector implements Selectable {
 
     /**
      * Clear the results from the prior poll
+     * 清除先前轮询的结果
      */
     private void clear() {
         this.completedSends.clear();

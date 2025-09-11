@@ -29,12 +29,28 @@ public class Producer extends Thread {
     private final String topic;
     private final Boolean isAsync;
 
+    /**
+     * 生产者构造函数
+     * topic: 主题名称
+     * isAsync: 是否异步发送
+     *
+     * @param topic
+     * @param isAsync
+     */
     public Producer(String topic, Boolean isAsync) {
         Properties props = new Properties();
+        // 连接kafka集群地址，这里使用默认配置：localhost:9092
         props.put("bootstrap.servers", KafkaProperties.KAFKA_SERVER_URL + ":" + KafkaProperties.KAFKA_SERVER_PORT);
+
+        // client.id: 客户端ID，用于标识当前生产者实例
         props.put("client.id", "DemoProducer");
+
+        // key.serializer: key序列化器，这里使用IntegerSerializer
+        // value.serializer: value序列化器，这里使用StringSerializer
         props.put("key.serializer", "org.apache.kafka.common.serialization.IntegerSerializer");
         props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+        // KafkaProducer实例化, 传入配置信息
         producer = new KafkaProducer<>(props);
         this.topic = topic;
         this.isAsync = isAsync;

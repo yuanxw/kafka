@@ -127,7 +127,7 @@ public final class Metadata {
     }
 
     /**
-     * Request an update of the current cluster metadata info, return the current version before the update
+     * 请求更新当前集群元数据信息，返回更新前的当前版本
      */
     public synchronized int requestUpdate() {
         this.needUpdate = true;
@@ -143,7 +143,7 @@ public final class Metadata {
     }
 
     /**
-     * Wait for metadata update until the current version is larger than the last version we know of
+     * 等待元数据更新，直到当前版本大于我们所知道的最后一个版本，或者等待超时
      */
     public synchronized void awaitUpdate(final int lastVersion, final long maxWaitMs) throws InterruptedException {
         if (maxWaitMs < 0) {
@@ -151,6 +151,7 @@ public final class Metadata {
         }
         long begin = System.currentTimeMillis();
         long remainingWaitMs = maxWaitMs;
+        // 当前版本小于等于我们所知道的最后一个版本，则线程等待。等待sender线程获得metadata数据，会唤醒producer线程。
         while (this.version <= lastVersion) {
             if (remainingWaitMs != 0)
                 wait(remainingWaitMs);

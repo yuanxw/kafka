@@ -18,6 +18,7 @@ package kafka.examples;
 
 public class KafkaConsumerProducerDemo {
     public static void main(String[] args) {
+//        // 判断是否是异步：如果参数个数为0，或者第一个参数不是"sync"，则是异步。生产环境一般是异步的数据处理。
         boolean isAsync = args.length == 0 || !args[0].trim().equalsIgnoreCase("sync");
         Producer producerThread = new Producer(KafkaProperties.TOPIC, isAsync);
         producerThread.start();
