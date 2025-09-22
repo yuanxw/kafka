@@ -213,6 +213,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         notifyClusterListeners(kafkaMetricsReporters ++ reporters.asScala)
 
         /* start log manager */
+        // 启动logManager
         logManager = createLogManager(zkUtils.zkClient, brokerState)
         logManager.startup()
 
@@ -641,14 +642,24 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
 
   def boundPort(listenerName: ListenerName): Int = socketServer.boundPort(listenerName)
 
+  /**
+   * 创建日志管理器实例，负责管理Kafka broker的日志存储与清理
+   * @param zkClient
+   * @param brokerState
+   * @return
+   */
   private def createLogManager(zkClient: ZkClient, brokerState: BrokerState): LogManager = {
+    // 创建默认的日志配置属性，基于Kafka服务器配置
     val defaultProps = KafkaServer.copyKafkaConfigToLog(config)
+    // 创建默认的日志配置对象
     val defaultLogConfig = LogConfig(defaultProps)
 
+    // 从ZooKeeper获取所有主题的配置信息，并转换为LogConfig对象
     val configs = AdminUtils.fetchAllTopicConfigs(zkUtils).map { case (topic, configs) =>
       topic -> LogConfig.fromProps(defaultProps, configs)
     }
     // read the log configurations from zookeeper
+    // 构建日志清理器配置（基于broker级配置参数）
     val cleanerConfig = CleanerConfig(numThreads = config.logCleanerThreads,
                                       dedupeBufferSize = config.logCleanerDedupeBufferSize,
                                       dedupeBufferLoadFactor = config.logCleanerDedupeBufferLoadFactor,
@@ -657,6 +668,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
                                       maxIoBytesPerSecond = config.logCleanerIoMaxBytesPerSecond,
                                       backOffMs = config.logCleanerBackoffMs,
                                       enableCleaner = config.logCleanerEnable)
+    // 实例化日志管理器（核心日志管理组件）
     new LogManager(logDirs = config.logDirs.map(new File(_)).toArray,
                    topicConfigs = configs,
                    defaultConfig = defaultLogConfig,

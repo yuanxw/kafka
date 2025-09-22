@@ -434,24 +434,43 @@ class Partition(val topic: String,
     laggingReplicas
   }
 
+  /**
+   * 将消息追加到当前分区的leader副本（仅当当前broker是该分区的leader时有效）
+   * @param records
+   * @param requiredAcks
+   * @return
+   */
   def appendRecordsToLeader(records: MemoryRecords, requiredAcks: Int = 0) = {
+    // 在"leaderIsrUpdateLock"读锁保护下执行操作，确保读取leader/ISR信息时的线程安全
     val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock) {
+      // 检查Leader副本是否在本地
       leaderReplicaIfLocal match {
         case Some(leaderReplica) =>
+          // 获取leader副本的日志对象（实际存储消息的日志文件）
           val log = leaderReplica.log.get
+          // 从日志配置中获取"最小同步副本数"（min.insync.replicas，确保消息安全的最低ISR数量）
           val minIsr = log.config.minInSyncReplicas
+          // 获取当前"同步副本集"（ISR，In-Sync Replicas）的大小
           val inSyncSize = inSyncReplicas.size
 
           // Avoid writing to leader if there are not enough insync replicas to make it safe
+          // 安全校验：如果同步副本数小于最小要求，且生产者要求"等待所有ISR确认"（requiredAcks=-1），则拒绝写入
+          // 原因：此时即使写入leader，也无法满足"所有ISR确认"的要求，消息可能因leader宕机丢失
           if (inSyncSize < minIsr && requiredAcks == -1) {
             throw new NotEnoughReplicasException("Number of insync replicas for partition %s is [%d], below required minimum [%d]"
               .format(topicPartition, inSyncSize, minIsr))
           }
 
+          // 将消息追加到日志，并自动分配偏移量（assignOffsets=true）
+          // 返回的info包含：消息的起始偏移量、结束偏移量、日志追加时间等信息
           val info = log.append(records, assignOffsets = true)
+
           // probably unblock some follower fetch requests since log end offset has been updated
+          // 日志末尾偏移量（LEO）已更新，尝试唤醒等待该分区数据的延迟fetch请求（让消费者能及时拉取新消息）
           replicaManager.tryCompleteDelayedFetch(TopicPartitionOperationKey(this.topic, this.partitionId))
           // we may need to increment high watermark since ISR could be down to 1
+          // 可能需要更新leader的高水位（HW，High Watermark），尤其是当ISR仅剩1个副本时
+          // 返回值表示高水位是否实际被更新
           (info, maybeIncrementLeaderHW(leaderReplica))
 
         case None =>
@@ -461,9 +480,10 @@ class Partition(val topic: String,
     }
 
     // some delayed operations may be unblocked after HW changed
+    // 如果高水位（HW）已更新，尝试完成依赖HW的延迟请求（如等待HW推进的produce请求）
     if (leaderHWIncremented)
       tryCompleteDelayedRequests()
-
+    // 返回日志追加结果（包含消息的偏移量等关键信息）
     info
   }
 

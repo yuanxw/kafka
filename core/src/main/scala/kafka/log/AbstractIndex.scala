@@ -239,33 +239,54 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
    * Find the slot in which the largest entry less than or equal to the given target key or value is stored.
    * The comparison is made using the `IndexEntry.compareTo()` method.
    *
-   * @param idx The index buffer
-   * @param target The index key to look for
+   * 查找存储小于或等于给定目标键或值的最大条目的槽位。
+   * 使用`IndexEntry.compareTo()`方法进行比较。
+   *
+   * @param idx The index buffer   索引缓冲区（ByteBuffer）
+   * @param target The index key to look for  要查找的目标索引键（偏移量或时间戳）
+   * @param searchEntity  搜索实体类型（指定是按偏移量还是时间戳搜索）
    * @return The slot found or -1 if the least entry in the index is larger than the target key or the index is empty
+   *         找到的槽位索引，如果索引中的最小条目大于目标键或索引为空，则返回-1
    */
   protected def indexSlotFor(idx: ByteBuffer, target: Long, searchEntity: IndexSearchEntity): Int = {
     // check if the index is empty
+    // 检查索引是否为空
     if(_entries == 0)
+      // 索引为空，直接返回-1
       return -1
 
     // check if the target offset is smaller than the least offset
+    // 检查目标键是否小于索引中最小的条目（第一个条目）
+    // 若目标键更小，说明索引中无符合条件的条目，返回-1
     if(compareIndexEntry(parseEntry(idx, 0), target, searchEntity) > 0)
       return -1
 
     // binary search for the entry
-    var lo = 0
-    var hi = _entries - 1
+    // 二分查找目标条目（高效定位，时间复杂度O(log n)）
+    var lo = 0 // 查找范围的起始索引（低指针）
+    var hi = _entries - 1   // 查找范围的结束索引（高指针）
+
     while(lo < hi) {
+      // 计算中间位置（向上取整，避免当lo=hi-1时的死循环）
+      // 等价于 (lo + hi + 1) / 2，确保mid偏向高指针
       val mid = ceil(hi/2.0 + lo/2.0).toInt
+
+      // 解析中间位置的索引条目
       val found = parseEntry(idx, mid)
+
+      // 比较中间条目与目标键
       val compareResult = compareIndexEntry(found, target, searchEntity)
       if(compareResult > 0)
+        // 中间条目大于目标键，缩小查找范围到[lo, mid-1]
         hi = mid - 1
       else if(compareResult < 0)
+        // 中间条目小于目标键，缩小查找范围到[mid, hi]
         lo = mid
       else
+        // 中间条目等于目标键，直接返回该位置
         return mid
     }
+    // 循环结束时lo=hi，此时lo为最大的小于或等于目标键的条目位置
     lo
   }
 

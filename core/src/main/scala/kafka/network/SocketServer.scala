@@ -447,6 +447,7 @@ private[kafka] class Processor(val id: Int,
         // 设置已排队的任何新连接
         configureNewConnections()
         // register any new responses for writing
+        // 处理新响应
         processNewResponses()
         // 完成NIO网络读写请求
         poll()
@@ -472,26 +473,37 @@ private[kafka] class Processor(val id: Int,
   }
 
   private def processNewResponses() {
+    // 从请求通道中获取当前处理器线程ID对应的响应
     var curr = requestChannel.receiveResponse(id)
+
+    // 循环处理所有待处理的响应，直到没有更多响应(null)
     while (curr != null) {
       try {
+        // 根据响应的操作类型进行不同处理
         curr.responseAction match {
           case RequestChannel.NoOpAction =>
             // There is no response to send to the client, we need to read more pipelined requests
             // that are sitting in the server's socket buffer
+            // 无需向客户端发送响应的情况，通常用于acks=0的成功请求
+            // 需要继续读取服务器socket缓冲区中的流水线请求
             curr.request.updateRequestMetrics
             trace("Socket server received empty response to send, registering for read: " + curr)
             val channelId = curr.request.connectionId
+            // 检查通道是否仍然存在或正在关闭
             if (selector.channel(channelId) != null || selector.closingChannel(channelId) != null)
+                // 重新注册通道的读事件监听器OP_READ
                 selector.unmute(channelId)
           case RequestChannel.SendAction =>
+            // 需要发送响应给客户端
             sendResponse(curr)
           case RequestChannel.CloseConnectionAction =>
+            // 需要主动关闭连接，通常用于处理错误情况
             curr.request.updateRequestMetrics
             trace("Closing socket connection actively according to the response code.")
             close(selector, curr.request.connectionId)
         }
       } finally {
+        // 无论处理成功与否，继续获取下一个响应
         curr = requestChannel.receiveResponse(id)
       }
     }

@@ -53,17 +53,25 @@ abstract class ShutdownableThread(val name: String, val isInterruptible: Boolean
 
   /**
    * This method is repeatedly invoked until the thread shuts down or this method throws an exception
+   * 该方法会被重复调用，直到线程关闭或该方法抛出异常为止。
+   * 这是一个抽象方法，由子类实现具体的业务逻辑（如拉取数据、处理任务等），
+   * 体现了模板方法设计模式：父类定义线程执行框架，子类填充具体工作内容。
    */
   def doWork(): Unit
 
   override def run(): Unit = {
     info("Starting ")
     try{
+      // 线程主循环：只要isRunning状态为true（通过原子变量控制，线程安全），就持续调用doWork()
+      // isRunning通常由外部调用shutdown()方法置为false，触发线程退出循环
       while(isRunning.get()){
+        // 调用抽象方法执行具体工作（由子类实现）
         doWork()
       }
     } catch{
+      // 捕获所有异常（包括Error），防止线程因未处理的异常意外终止
       case e: Throwable =>
+        // 仅当线程仍处于运行状态时记录错误（避免处理已主动停止的线程异常）
         if(isRunning.get())
           error("Error due to ", e)
     }

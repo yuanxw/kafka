@@ -145,12 +145,22 @@ public class FileRecords extends AbstractRecords implements Closeable {
 
     /**
      * Append log entries to the buffer
-     * @param records The records to append
-     * @return the number of bytes written to the underlying file
+     * 将日志条目追加到缓冲区（内存缓冲区或磁盘缓冲区）
+     *
+     * @param records 待追加的内存日志条目集合（包含多条消息的二进制数据）
+     * @return the number of bytes written to the underlying file  实际写入底层存储设备的字节数
      */
     public int append(MemoryRecords records) throws IOException {
+        // 核心写入操作：将内存中的日志条目完全写入文件通道
+        // writeFullyTo 保证：1. 完整写入所有记录 2. 处理缓冲区边界 3. 确保数据持久化到通道
         int written = records.writeFullyTo(channel);
+
+        // 原子更新缓冲区大小（线程安全方式）
+        // size 是 AtomicInteger 类型变量，用于跟踪当前缓冲区的总字节数
+        // getAndAdd() 是原子操作，避免多线程竞争导致的数据不一致
         size.getAndAdd(written);
+
+        // 返回实际写入的字节数（供调用方统计写入量或进行后续处理）
         return written;
     }
 

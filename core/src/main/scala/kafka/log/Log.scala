@@ -345,31 +345,40 @@ class Log(@volatile var dir: File,
    * This method will generally be responsible for assigning offsets to the messages,
    * however if the assignOffsets=false flag is passed we will only check that the existing offsets are valid.
    *
-   * @param records The log records to append
-   * @param assignOffsets Should the log assign offsets to this message set or blindly apply what it is given
-   * @throws KafkaStorageException If the append fails due to an I/O error.
-   * @return Information about the appended messages including the first and last offset.
+   *  将此消息集追加到日志的活动段，如有必要则滚动到新段。
+   *  此方法通常负责为消息分配偏移量，但如果传入 assignOffsets=false 标志，则只会检查现有偏移量是否有效。
+   *
+   * @param records The log records to append  要追加的日志记录
+   * @param assignOffsets Should the log assign offsets to this message set or blindly apply what it is given 日志是否应分配偏移量，还是直接使用给定的偏移量
+   * @throws KafkaStorageException If the append fails due to an I/O error.  如果由于I/O错误导致追加失败
+   * @return Information about the appended messages including the first and last offset. 关于追加消息的信息，包括第一个和最后一个偏移量
+   *
    */
   def append(records: MemoryRecords, assignOffsets: Boolean = true): LogAppendInfo = {
+    // 步骤一：分析和验证数据
     val appendInfo = analyzeAndValidateRecords(records)
 
     // if we have any valid messages, append them to the log
+    // 如果没有有效消息，直接返回
     if (appendInfo.shallowCount == 0)
       return appendInfo
 
     // trim any invalid bytes or partial messages before appending it to the on-disk log
+    // 修剪任何无效字节或部分消息，然后再将其追加到磁盘日志
     var validRecords = trimInvalidBytes(records, appendInfo)
 
     try {
       // they are valid, insert them in the log
+      // 在synchronized锁保护下执行追加操作
       lock synchronized {
-
         if (assignOffsets) {
           // assign offsets to the message set
+          // 步骤二：分配offset,偏移量分配模式
           val offset = new LongRef(nextOffsetMetadata.messageOffset)
           appendInfo.firstOffset = offset.value
           val now = time.milliseconds
           val validateAndOffsetAssignResult = try {
+            // 验证消息并分配偏移量
             LogValidator.validateMessagesAndAssignOffsets(validRecords,
                                                           offset,
                                                           now,
@@ -386,16 +395,19 @@ class Log(@volatile var dir: File,
           appendInfo.maxTimestamp = validateAndOffsetAssignResult.maxTimestamp
           appendInfo.offsetOfMaxTimestamp = validateAndOffsetAssignResult.shallowOffsetOfMaxTimestamp
           appendInfo.lastOffset = offset.value - 1
+          // 如果时间戳类型是日志追加时间，则设置日志追加时间
           if (config.messageTimestampType == TimestampType.LOG_APPEND_TIME)
             appendInfo.logAppendTime = now
 
           // re-validate message sizes if there's a possibility that they have changed (due to re-compression or message
           // format conversion)
+          // 如果消息大小可能已更改（由于重新压缩或消息格式转换），重新验证消息大小
           if (validateAndOffsetAssignResult.messageSizeMaybeChanged) {
             for (logEntry <- validRecords.shallowEntries.asScala) {
               if (logEntry.sizeInBytes > config.maxMessageSize) {
                 // we record the original message set size instead of the trimmed size
                 // to be consistent with pre-compression bytesRejectedRate recording
+                // 记录原始消息集大小而不是修剪后的大小，以保持与压缩前bytesRejectedRate记录的一致性
                 BrokerTopicStats.getBrokerTopicStats(topicPartition.topic).bytesRejectedRate.mark(records.sizeInBytes)
                 BrokerTopicStats.getBrokerAllTopicsStats.bytesRejectedRate.mark(records.sizeInBytes)
                 throw new RecordTooLargeException("Message size is %d bytes which exceeds the maximum configured message size of %d."
@@ -406,23 +418,27 @@ class Log(@volatile var dir: File,
 
         } else {
           // we are taking the offsets we are given
+          // 直接使用给定的偏移量
           if (!appendInfo.offsetsMonotonic || appendInfo.firstOffset < nextOffsetMetadata.messageOffset)
             throw new IllegalArgumentException("Out of order offsets found in " + records.deepEntries.asScala.map(_.offset))
         }
 
         // check messages set size may be exceed config.segmentSize
+        // 检查消息集大小是否可能超过配置的段大小
         if (validRecords.sizeInBytes > config.segmentSize) {
           throw new RecordBatchTooLargeException("Message set size is %d bytes which exceeds the maximum configured segment size of %d."
             .format(validRecords.sizeInBytes, config.segmentSize))
         }
 
         // maybe roll the log if this segment is full
+        // 步骤四：获取一个可用的segment。如果当前段已满，可能需要滚动日志
         val segment = maybeRoll(messagesSize = validRecords.sizeInBytes,
           maxTimestampInMessages = appendInfo.maxTimestamp,
           maxOffsetInMessages = appendInfo.lastOffset)
 
 
         // now append to the log
+        // 步骤五：把数据写入到segment中
         segment.append(firstOffset = appendInfo.firstOffset,
           largestOffset = appendInfo.lastOffset,
           largestTimestamp = appendInfo.maxTimestamp,
@@ -430,11 +446,13 @@ class Log(@volatile var dir: File,
           records = validRecords)
 
         // increment the log end offset
+        // 步骤六：更新LEO，LEO = lastOffset + 1
         updateLogEndOffset(appendInfo.lastOffset + 1)
 
         trace("Appended message set to log %s with first offset: %d, next offset: %d, and messages: %s"
           .format(this.name, appendInfo.firstOffset, nextOffsetMetadata.messageOffset, validRecords))
 
+        // 步骤七：根据条件判断，然后内存里面的数据写到磁盘，默认config.flushInterval = Long.MaxValue。条件不满足，则不写到磁盘。
         if (unflushedMessages >= config.flushInterval)
           flush()
 
@@ -537,53 +555,81 @@ class Log(@volatile var dir: File,
   /**
    * Read messages from the log.
    *
-   * @param startOffset The offset to begin reading at
-   * @param maxLength The maximum number of bytes to read
-   * @param maxOffset The offset to read up to, exclusive. (i.e. this offset NOT included in the resulting message set)
-   * @param minOneMessage If this is true, the first message will be returned even if it exceeds `maxLength` (if one exists)
+   * 从日志中读取消息。
+   * 该方法是Kafka日志存储层读取消息的核心实现，负责从指定偏移量开始读取消息，
+   * 处理长度限制、偏移量范围及并发安全等问题，为上层拉取请求提供原始消息数据。
    *
-   * @throws OffsetOutOfRangeException If startOffset is beyond the log end offset or before the base offset of the first segment.
-   * @return The fetch data information including fetch starting offset metadata and messages read.
+   * @param startOffset The offset to begin reading at     开始读取的偏移量（包含此偏移量）
+   * @param maxLength The maximum number of bytes to read  最大读取字节数（限制返回消息的总大小）
+   * @param maxOffset The offset to read up to, exclusive. (i.e. this offset NOT included in the resulting message set)    最大读取偏移量（不包含此偏移量，即读取到该偏移量之前）
+   * @param minOneMessage If this is true, the first message will be returned even if it exceeds `maxLength` (if one exists) 若为true，即使第一条消息超过maxLength，也会返回该消息（如果存在）
+   *
+   * @throws OffsetOutOfRangeException If startOffset is beyond the log end offset or before the base offset of the first segment.  当startOffset超过日志末端偏移量或小于第一个日志段的基础偏移量时抛出
+   * @return The fetch data information including fetch starting offset metadata and messages read.  读取数据信息，包含读取起始偏移量的元数据和读取到的消息集
+   *
    */
   def read(startOffset: Long, maxLength: Int, maxOffset: Option[Long] = None, minOneMessage: Boolean = false): FetchDataInfo = {
     trace("Reading %d bytes from offset %d in log %s of length %d bytes".format(maxLength, startOffset, name, size))
 
     // Because we don't use lock for reading, the synchronization is a little bit tricky.
     // We create the local variables to avoid race conditions with updates to the log.
+
+    // 由于读取操作未使用锁，同步步处理需要特别注意。
+    // 创建局部变量存储当前日志状态，避免读取过程中因日志更新导致的竞态条件
     val currentNextOffsetMetadata = nextOffsetMetadata
     val next = currentNextOffsetMetadata.messageOffset
+
+    // 若起始偏移量等于日志末端偏移量，说明没有可读取的消息，返回空消息集
     if(startOffset == next)
       return FetchDataInfo(currentNextOffsetMetadata, MemoryRecords.EMPTY)
 
+
+    // 查找包含起始偏移量的日志段（floorEntry找到小于等于startOffset的最大键对应的段）
     var entry = segments.floorEntry(startOffset)
 
     // attempt to read beyond the log end offset is an error
+    // 尝试读取超过日志末端偏移量是一个错误
     if(startOffset > next || entry == null)
       throw new OffsetOutOfRangeException("Request for offset %d but we only have log segments in the range %d to %d.".format(startOffset, segments.firstKey, next))
 
     // Do the read on the segment with a base offset less than the target offset
     // but if that segment doesn't contain any messages with an offset greater than that
     // continue to read from successive segments until we get some messages or we reach the end of the log
+    // 在基准偏移量小于目标偏移量的段上进行读取
+    // 但如果该段不包含任何偏移量大于目标的消息，
+    // 继续从后续段读取，直到获取一些消息或到达日志末尾
     while(entry != null) {
       // If the fetch occurs on the active segment, there might be a race condition where two fetch requests occur after
       // the message is appended but before the nextOffsetMetadata is updated. In that case the second fetch may
       // cause OffsetOutOfRangeException. To solve that, we cap the reading up to exposed position instead of the log
       // end of the active segment.
+
+      // 如果获取操作发生在活跃段上，可能会出现竞态条件：
+      // 两个获取请求在消息已附加但nextOffsetMetadata尚未更新时发生。
+      // 在这种情况下，第二个获取可能导致OffsetOutRangeException。
+      // 为了解决这个问题，我们将读取上限设置为暴露的位置，而不是活跃段的日志末端。
       val maxPosition = {
         if (entry == segments.lastEntry) {
+          // 如果是最后一个段（活跃段），使用暴露的位置而不是段大小
           val exposedPos = nextOffsetMetadata.relativePositionInSegment.toLong
           // Check the segment again in case a new segment has just rolled out.
+          // 再次检查段，以防有新段刚刚滚动出来
           if (entry != segments.lastEntry)
             // New log segment has rolled out, we can read up to the file end.
+            // 新的日志段已滚动出来，我们可以读取到文件末尾
             entry.getValue.size
           else
             exposedPos
         } else {
+          // 对于非活跃段，直接使用段大小
           entry.getValue.size
         }
       }
+
+      // 调用段对象的read方法实际读取数据
       val fetchInfo = entry.getValue.read(startOffset, maxOffset, maxLength, maxPosition, minOneMessage)
       if(fetchInfo == null) {
+        // 如果当前段没有找到数据，尝试下一个段
         entry = segments.higherEntry(entry.getKey)
       } else {
         return fetchInfo
@@ -593,6 +639,9 @@ class Log(@volatile var dir: File,
     // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
     // this can happen when all messages with offset larger than start offsets have been deleted.
     // In this case, we will return the empty set with log end offset metadata
+    // 好吧，我们已经超过最后一个段的末尾但没有获取到数据，尽管起始偏移量在范围内，
+    // 当所有偏移量大于起始偏移量的消息都被删除时，可能会发生这种情况。
+    // 在这种情况下，我们将返回带有日志末端偏移量元数据的空集
     FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
   }
 
@@ -661,18 +710,30 @@ class Log(@volatile var dir: File,
    *
    * @param predicate A function that takes in a single log segment and returns true iff it is deletable
    * @return The number of segments deleted
+   *
+   * 删除任何匹配给定参数函数的日志段，
+   * 从最旧的段开始向前移动，直到遇到不匹配的段为止。
+   *
+   * @param predicate 一个函数，接收单个日志段作为参数，返回true表示该段可删除
+   * @return 删除的段数量
    */
   private def deleteOldSegments(predicate: LogSegment => Boolean): Int = {
+    // 在同步锁内执行，确保线程安全
     lock synchronized {
+      // 获取符合删除条件的段列表（按照从旧到新的顺序）
       val deletable = deletableSegments(predicate)
       val numToDelete = deletable.size
       if (numToDelete > 0) {
         // we must always have at least one segment, so if we are going to delete all the segments, create a new one first
+        // 如果将要删除所有段，必须先创建一个新段（必须始终至少有一个段）
         if (segments.size == numToDelete)
+          // 创建新的日志段
           roll()
         // remove the segments for lookups
+        // 从查找结构中移除这些段并执行实际删除
         deletable.foreach(deleteSegment)
       }
+      // 返回删除的段数量
       numToDelete
     }
   }
@@ -684,37 +745,69 @@ class Log(@volatile var dir: File,
     * @return the segments ready to be deleted
     */
   private def deletableSegments(predicate: LogSegment => Boolean) = {
+    // 获取最后一个日志段（活跃段）
     val lastEntry = segments.lastEntry
+    // 如果没有段，返回空序列
     if (lastEntry == null) Seq.empty
+    // 从日志段列表（按从旧到新排序）中，依次获取符合条件的段：
+    // 1. 满足函数的判断（predicate(s)为true）
+    // 2. 要么不是最后一个段（s.baseOffset != 最后一段的baseOffset），要么是最后一个段但大小大于0（避免删除空的最后一段）
     else logSegments.takeWhile(s => predicate(s) && (s.baseOffset != lastEntry.getValue.baseOffset || s.size > 0))
   }
 
   /**
     * Delete any log segments that have either expired due to time based retention
     * or because the log size is > retentionSize
+    * 删除任何因基于时间的保留策略过期或日志大小超过保留大小限制的日志段
     */
   def deleteOldSegments(): Int = {
+    // 检查是否启用了删除配置，如果未启用则直接返回0
     if (!config.delete) return 0
+    // 分别删除因时间保留策略和大小保留策略而过期的日志段，并返回总删除数量
     deleteRetenionMsBreachedSegments() + deleteRetentionSizeBreachedSegments()
   }
 
+  /**
+   * 删除因时间保留策略（retentionMs）过期的日志段
+   * 该方法是时间维度日志清理的具体实现，仅处理符合时间过期条件的日志段
+   * @return 本次删除的日志段数量
+   */
   private def deleteRetenionMsBreachedSegments() : Int = {
+    // 若retentionMs配置为负数，表示禁用时间保留策略，直接返回0（不删除任何段）
     if (config.retentionMs < 0) return 0
+
+    // 获取当前时间戳，作为判断过期的基准时间
     val startMs = time.milliseconds
+
+    // 调用通用删除方法，传入时间过期判断条件：
+    // 日志段的最大时间戳（largestTimestamp）与当前时间的差值 > 配置的retentionMs
+    // 即：日志段最晚期数据的时间距离现在已超过保留期限
     deleteOldSegments(startMs - _.largestTimestamp > config.retentionMs)
   }
 
+  /**
+   * 删除因总大小超过保留限制（retentionSize）而需要清理的日志段
+   * 该方法是大小维度日志清理的具体实现，通过计算超出的空间并删除最旧的日志段来满足大小限制
+   * @return 本次删除的日志段数量
+   */
   private def deleteRetentionSizeBreachedSegments() : Int = {
+    // 若retentionSize配置为负数（禁用大小策略），或当前日志总大小未超过限制，直接返回0
     if (config.retentionSize < 0 || size < config.retentionSize) return 0
+    // 计算当前日志总大小超出限制的部分（需要删除的空间）
     var diff = size - config.retentionSize
+
+    // 定义判断日志段是否应被删除的函数：
+    // 从最旧的日志段开始检查，若删除该段后能减少超出的空间（diff仍非负），则标记为待删除
+    // 同时更新剩余需要删除的空间（diff减去当前段大小）
     def shouldDelete(segment: LogSegment) = {
       if (diff - segment.size >= 0) {
-        diff -= segment.size
-        true
+        diff -= segment.size // 更新剩余需删除的空间
+        true // 该段需要被删除
       } else {
-        false
+        false // 该段无需删除（删除后会导致总大小小于限制，保留该段）
       }
     }
+    // 调用通用删除方法，传入上述大小判断条件
     deleteOldSegments(shouldDelete)
   }
 
@@ -741,24 +834,46 @@ class Log(@volatile var dir: File,
   /**
    * Roll the log over to a new empty log segment if necessary.
    *
-   * @param messagesSize The messages set size in bytes
-   * @param maxTimestampInMessages The maximum timestamp in the messages.
-   * logSegment will be rolled if one of the following conditions met
+   * 根据需要，将日志滚动（Rollover）到一个新的空日志段（Log Segment）。
+   * 当日志段满足特定条件（如大小、时间或索引已满）时，会创建一个新的活跃段。
+   *
+   * @param messagesSize The messages set size in bytes  消息集的字节大小
+   * @param maxTimestampInMessages The maximum timestamp in the messages.  消息集中的最大时间戳。
+   * logSegment will be rolled if one of the following conditions met  消息集中的最大偏移量。
    * <ol>
    * <li> The logSegment is full
    * <li> The maxTime has elapsed since the timestamp of first message in the segment (or since the create time if
    * the first message does not have a timestamp)
    * <li> The index is full
    * </ol>
-   * @return The currently active segment after (perhaps) rolling to a new segment
+   * @return The currently active segment after (perhaps) rolling to a new segment 当前活跃的日志段（如果发生了滚动，则是新创建的段；否则是原来的段）
    */
   private def maybeRoll(messagesSize: Int, maxTimestampInMessages: Long, maxOffsetInMessages: Long): LogSegment = {
+    // 1. 获取当前的活跃日志段
     val segment = activeSegment
+
+    // 2. 获取当前时间戳
     val now = time.milliseconds
+
+    // 3. 判断是否达到基于时间的滚动条件：
+    //    - 计算当前段从第一个消息（或创建时间）到现在（或消息最大时间戳）所等待的时间
+    //    - 检查这个时间是否超过了配置的段最大存活时间（segmentMs）减去一个随机抖动（rollJitterMs）
+    //    - 这样做的目的是避免所有日志段在同一时刻滚动，从而分散磁盘I/O压力
     val reachedRollMs = segment.timeWaitedForRoll(now, maxTimestampInMessages) > config.segmentMs - segment.rollJitterMs
+
+    // 4. 判断是否需要滚动的核心条件（满足任意一条即可）：
+    // 条件1：当前段大小 + 新消息大小 > 配置的段大小（避免添加后超过限制）
     if (segment.size > config.segmentSize - messagesSize ||
+        // 条件2：段已包含消息，且达到时间滚动条件
         (segment.size > 0 && reachedRollMs) ||
-        segment.index.isFull || segment.timeIndex.isFull || !segment.canConvertToRelativeOffset(maxOffsetInMessages)) {
+        // 条件3：偏移量索引已满
+        segment.index.isFull ||
+        // 条件4：时间索引已满
+        segment.timeIndex.isFull ||
+        // 条件5：无法将最大偏移量转换为相对偏移量（防止索引溢出）
+        !segment.canConvertToRelativeOffset(maxOffsetInMessages)) {
+
+       // 输出调试日志，说明滚动原因（包含当前段大小、索引使用情况、存活时间等信息）
       debug(s"Rolling new log segment in $name (log_size = ${segment.size}/${config.segmentSize}}, " +
           s"index_size = ${segment.index.entries}/${segment.index.maxEntries}, " +
           s"time_index_size = ${segment.timeIndex.entries}/${segment.timeIndex.maxEntries}, " +
@@ -773,8 +888,19 @@ class Log(@volatile var dir: File,
         base offset was too low to contain the next message.  This edge case is possible when a replica is recovering a
         highly compacted topic from scratch.
        */
+      /*
+        此处使用 maxOffsetInMessages - Integer.MAX_VALUE 作为新段基础偏移量的启发式计算：
+        由于消息中的偏移量差值不会超过 Integer.MAX_VALUE，这个值保证小于等于消息集中的真实起始偏移量。
+        这种计算方式避免了解压缩消息（ follower在日志追加时尽量避免的操作）来获取真实起始偏移量。
+
+        历史行为中，新段基础偏移量直接使用旧段的日志结束偏移量，但在以下场景会出问题：
+        当两条连续消息的偏移量差值超过 Integer.MAX_VALUE + 1 时，旧逻辑可能导致新段基础偏移量过小，
+        无法容纳下一条消息。这种边缘情况在副本从高度压缩的主题恢复时可能发生。
+       */
+      // 执行滚动操作，创建新段（传入计算的基础偏移量）
       roll(maxOffsetInMessages - Integer.MAX_VALUE)
     } else {
+      // 不满足滚动条件，返回当前活跃段
       segment
     }
   }
@@ -783,50 +909,72 @@ class Log(@volatile var dir: File,
    * Roll the log over to a new active segment starting with the current logEndOffset.
    * This will trim the index to the exact size of the number of entries it currently contains.
    *
-   * @return The newly rolled segment
+   * 将日志滚动到一个新的活跃段，新段的起始偏移量从当前的logEndOffset开始。
+   * 此操作会将索引修剪（trim）到其当前包含条目的精确大小。
+   *
+   * @return The newly rolled segment 期望的新段起始偏移量
    */
   def roll(expectedNextOffset: Long = 0): LogSegment = {
     val start = time.nanoseconds
+    // 获取锁，确保线程安全
     lock synchronized {
+      // 1. 确定新段的起始偏移量（baseOffset）：
+      //    取「期望的下一偏移量」和当前「日志结束偏移量（LEO）」中的最大值，确保偏移量是单调递增的
       val newOffset = Math.max(expectedNextOffset, logEndOffset)
+
+      // 2. 创建新段所需的文件对象：日志文件（.log）、位移索引文件（.index）、时间戳索引文件（.timeindex）
       val logFile = Log.logFile(dir, newOffset)
       val indexFile = indexFilename(dir, newOffset)
       val timeIndexFile = timeIndexFilename(dir, newOffset)
+
+      // 3. 安全检查：如果这些文件已存在（例如，由于先前失败的操作残留），则先删除它们
       for(file <- List(logFile, indexFile, timeIndexFile); if file.exists) {
         warn("Newly rolled segment file " + file.getName + " already exists; deleting it first")
         file.delete()
       }
 
+      // 4. 处理当前的最后一个段（即即将变为非活跃的段）
+      // 获取 segments TreeMap 中的最后一个条目
       segments.lastEntry() match {
-        case null =>
-        case entry => {
+        case null => // 如果当前没有段，则不做任何操作（例如，日志刚初始化时）
+        case entry => {  // 通知该段它即将变为非活跃状态（可能用于执行一些清理或状态更新）
           val seg = entry.getValue
-          seg.onBecomeInactiveSegment()
-          seg.index.trimToValidSize()
-          seg.timeIndex.trimToValidSize()
-          seg.log.trim()
+          seg.onBecomeInactiveSegment()   // 标记旧段为非活跃状态（不再写入新数据）
+          seg.index.trimToValidSize()     // 调整偏移量索引大小为实际条目数（释放冗余空间）
+          seg.timeIndex.trimToValidSize() // 调整时间索引大小为实际条目数（释放冗余空间）
+          seg.log.trim()                  // 截断日志文件到实际数据大小（去除预分配的空空间）
         }
       }
-      val segment = new LogSegment(dir,
-                                   startOffset = newOffset,
-                                   indexIntervalBytes = config.indexInterval,
-                                   maxIndexSize = config.maxIndexSize,
-                                   rollJitterMs = config.randomSegmentJitter,
-                                   time = time,
-                                   fileAlreadyExists = false,
-                                   initFileSize = initFileSize,
-                                   preallocate = config.preallocate)
+
+      // 创建新的日志段实例
+      val segment = new LogSegment(dir,                     // 日志存储目录
+                                   startOffset = newOffset, // 新段的起始偏移量
+                                   indexIntervalBytes = config.indexInterval, // 索引间隔（每写入多少字节数据创建一个索引
+                                   maxIndexSize = config.maxIndexSize,        // 索引文件的最大大小限制
+                                   rollJitterMs = config.randomSegmentJitter, // 滚动抖动时间（避免多个段同时滚动）
+                                   time = time,                         // 时间工具类
+                                   fileAlreadyExists = false,           // 标记文件为新创建（非已存在文件）
+                                   initFileSize = initFileSize,         // 初始文件大小（预分配空间时使用）
+                                   preallocate = config.preallocate)    // 是否预分配文件空间
+
+      // 将新段添加到段集合中，返回可能存在的冲突段（若存在则说明偏移量重复）
       val prev = addSegment(segment)
       if(prev != null)
         throw new KafkaException("Trying to roll a new log segment for topic partition %s with start offset %d while it already exists.".format(name, newOffset))
+
       // We need to update the segment base offset and append position data of the metadata when log rolls.
       // The next offset should not change.
+      // 滚动后更新日志结束偏移量（保持与下一个偏移量元数据一致，确保偏移量连续性）
       updateLogEndOffset(nextOffsetMetadata.messageOffset)
+
       // schedule an asynchronous flush of the old segment
+      // 调度异步刷新旧段（避免阻塞当前滚动操作，确保旧段数据最终持久化）
       scheduler.schedule("flush-log", () => flush(newOffset), delay = 0L)
 
+      // 输出滚动完成日志，包含耗时统计（转换为毫秒）
       info("Rolled new log segment for '" + name + "' in %.0f ms.".format((System.nanoTime - start) / (1000.0*1000.0)))
 
+      // 返回新创建的日志段（作为新的活跃段）
       segment
     }
   }

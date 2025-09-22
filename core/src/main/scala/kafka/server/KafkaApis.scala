@@ -71,13 +71,16 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   /**
    * Top-level method that handles all requests and multiplexes to the right api
+   * 处理所有请求并多路复用到正确 API 的顶级方法
    */
   def handle(request: RequestChannel.Request) {
     try {
       trace("Handling request:%s from connection %s;securityProtocol:%s,principal:%s".
         format(request.requestDesc(true), request.connectionId, request.securityProtocol, request.session.principal))
       ApiKeys.forId(request.requestId) match {
+        // 处理生产者请求
         case ApiKeys.PRODUCE => handleProducerRequest(request)
+        // 处理Fetch请求
         case ApiKeys.FETCH => handleFetchRequest(request)
         case ApiKeys.LIST_OFFSETS => handleOffsetRequest(request)
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
@@ -346,23 +349,34 @@ class KafkaApis(val requestChannel: RequestChannel,
    * Handle a produce request
    */
   def handleProducerRequest(request: RequestChannel.Request) {
-    // 获取produce请求到broker的数据
+    // 将请求体转换为ProduceRequest（生产者请求）类型
     val produceRequest = request.body.asInstanceOf[ProduceRequest]
+    // 计算请求的总字节大小（请求头+请求体），用于配额控制
     val numBytesAppended = request.header.sizeOf + produceRequest.sizeOf
 
-    // 按照分区进行处理
+    // 分区处理：将请求中的分区分为两类
+    // existingAndAuthorizedForDescribeTopics: 对应的topic存在，并且用户有权限
+    // nonExistingOrUnauthorizedForDescribeTopics: 对应的topic不存在，或者用户没有权限
     val (existingAndAuthorizedForDescribeTopics, nonExistingOrUnauthorizedForDescribeTopics) =
       produceRequest.partitionRecordsOrFail.asScala.partition { case (tp, _) =>
+        // 检查是否有主题描述权限且主题存在于元数据缓存中
         authorize(request.session, Describe, new Resource(auth.Topic, tp.topic)) && metadataCache.contains(tp.topic)
       }
 
+    // 进一步分区：将有Describe权限的分区分为两类
+    // 1. 有Write权限的分区（可进行写入操作）
+    // 2. 无Write权限的分区
     val (authorizedRequestInfo, unauthorizedForWriteRequestInfo) = existingAndAuthorizedForDescribeTopics.partition {
       case (tp, _) => authorize(request.session, Write, new Resource(auth.Topic, tp.topic))
     }
 
     // the callback for sending a produce response
+    // 定义发送响应的回调函数
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]) {
-
+      // 合并所有分区的响应状态，包括：
+      // 1. 实际处理的分区响应
+      // 2. 无写权限分区的错误响应
+      // 3. 不存在或无描述权限分区的错误响应
       val mergedResponseStatus = responseStatus ++
         unauthorizedForWriteRequestInfo.mapValues(_ => new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)) ++
         nonExistingOrUnauthorizedForDescribeTopics.mapValues(_ => new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION))
@@ -380,7 +394,12 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
+      /**
+       * 定义生产响应的具体处理逻辑（包含延迟时间参数，用于配额限流）
+       * @param delayTimeMs
+       */
       def produceResponseCallback(delayTimeMs: Int) {
+        //  当acks=0时，生产者不需要等待服务器响应。但如果处理过程中出现错误，需要关闭连接通知客户端
         if (produceRequest.acks == 0) {
           // no operation needed if producer request.required.acks = 0; however, if there is any error in handling
           // the request, since no response is expected by the producer, the server will close socket server so that
@@ -399,14 +418,18 @@ class KafkaApis(val requestChannel: RequestChannel,
             requestChannel.noOperation(request.processor, request)
           }
         } else {
+          // 当acks≠0时，构建响应体并发送
           val respBody = request.header.apiVersion match {
+            // v0版本响应
             case 0 => new ProduceResponse(mergedResponseStatus.asJava)
+            // v1和v2版本响应
             case version@(1 | 2) => new ProduceResponse(mergedResponseStatus.asJava, delayTimeMs, version)
             // This case shouldn't happen unless a new version of ProducerRequest is added without
             // updating this part of the code to handle it properly.
+            // 处理未适配的API版本（理论上不会发生，除非新增版本未更新此处代码）
             case version => throw new IllegalArgumentException(s"Version `$version` of ProduceRequest is not handled. Code must be updated.")
           }
-
+          // 发送响应到请求通道
           requestChannel.sendResponse(new RequestChannel.Response(request, respBody))
         }
       }
@@ -414,6 +437,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       // When this callback is triggered, the remote API call has completed
       request.apiRemoteCompleteTimeMs = time.milliseconds
 
+      // 记录生产配额使用并可能进行限流
       quotas.produce.recordAndMaybeThrottle(
         request.session.sanitizedUser,
         request.header.clientId,
@@ -421,18 +445,26 @@ class KafkaApis(val requestChannel: RequestChannel,
         produceResponseCallback)
     }
 
+    // 如果没有需要处理的分区，直接发送空响应
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Map.empty)
     else {
+      // 检查是否允许操作内部主题（仅允许管理客户端）
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
       // call the replica manager to append messages to the replicas
+      // 把接收到的数据追加到磁盘上
+      // produceRequest.timeout.toLong: 请求超时时间
+      // produceRequest.acks: 确认模式（0：不确认，1：Leader确认，-1：所有副本确认）
+      // internalTopicsAllowed: 是否允许内部主题写入
+      // authorizedRequestInfo: 写入权限的分区记录
+      // sendResponseCallback: 响应回调函数
       replicaManager.appendRecords(
         produceRequest.timeout.toLong,
         produceRequest.acks,
         internalTopicsAllowed,
         authorizedRequestInfo,
-        sendResponseCallback)
+        sendResponseCallback) // 响应回调函数
 
       // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
       // hence we clear its data here inorder to let GC re-claim its memory since it is already appended to log
@@ -442,41 +474,53 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   /**
    * Handle a fetch request
+   * 处理Fetch请求
    */
   def handleFetchRequest(request: RequestChannel.Request) {
+    // 1. 从请求中获取FetchRequest对象和版本信息
     val fetchRequest = request.body.asInstanceOf[FetchRequest]
     val versionId = request.header.apiVersion
     val clientId = request.header.clientId
 
+    // 2. 根据集群权限对请求的主题进行分区
     val (clusterAuthorizedTopics, clusterUnauthorizedTopics) =
       if (fetchRequest.isFromFollower() && !authorize(request.session, ClusterAction, Resource.ClusterResource)) {
+        // 如果是来自follower的请求且没有集群权限，所有主题都视为未授权
         (Seq.empty, fetchRequest.fetchData.asScala.toSeq)
       } else {
+        // 否则，所有主题都视为有集群权限
         (fetchRequest.fetchData.asScala.toSeq, Seq.empty)
       }
 
+    // 3. 将有集群权限的主题分为存在且具有Describe权限的主题和不存在或没有Describe权限的主题
     val (existingAndAuthorizedForDescribeTopics, nonExistingOrUnauthorizedForDescribeTopics) = clusterAuthorizedTopics.partition {
       case (tp, _) => authorize(request.session, Describe, new Resource(auth.Topic, tp.topic)) && metadataCache.contains(tp.topic)
     }
 
+    // 4. 将存在且具有Describe权限的主题分为有Read权限的主题和没有Read权限的主题
     val (authorizedRequestInfo, unauthorizedForReadRequestInfo) = existingAndAuthorizedForDescribeTopics.partition {
       case (tp, _) => authorize(request.session, Read, new Resource(auth.Topic, tp.topic))
     }
 
+    // 5. 为没有集群权限的主题准备错误响应数据
     val clusterUnauthorizedPartitionData = clusterUnauthorizedTopics.map {
       case (tp, _) => (tp, new FetchResponse.PartitionData(Errors.CLUSTER_AUTHORIZATION_FAILED.code, FetchResponse.INVALID_HIGHWATERMARK, MemoryRecords.EMPTY))
     }
 
+    // 6. 为不存在或没有Describe权限的主题准备错误响应数据
     val nonExistingOrUnauthorizedForDescribePartitionData = nonExistingOrUnauthorizedForDescribeTopics.map {
       case (tp, _) => (tp, new FetchResponse.PartitionData(Errors.UNKNOWN_TOPIC_OR_PARTITION.code, FetchResponse.INVALID_HIGHWATERMARK, MemoryRecords.EMPTY))
     }
 
+    // 7. 为没有Read权限的主题准备错误响应数据
     val unauthorizedForReadPartitionData = unauthorizedForReadRequestInfo.map {
       case (tp, _) => (tp, new FetchResponse.PartitionData(Errors.TOPIC_AUTHORIZATION_FAILED.code, FetchResponse.INVALID_HIGHWATERMARK, MemoryRecords.EMPTY))
     }
 
     // the callback for sending a fetch response
+    // 发送拉取响应的回调函数：负责构建最终响应、处理格式转换、记录指标并发送响应
     def sendResponseCallback(responsePartitionData: Seq[(TopicPartition, FetchPartitionData)]) {
+      // 对响应数据进行版本降级转换（如果需要）
       val convertedPartitionData = {
         responsePartitionData.map { case (tp, data) =>
 
@@ -488,6 +532,13 @@ class KafkaApis(val requestChannel: RequestChannel,
           // Please note that if the message format is changed from a higher version back to lower version this
           // test might break because some messages in new message format can be delivered to consumers before 0.10.0.0
           // without format down conversion.
+
+          // 我们只在以下情况下进行版本降级：
+          // 1. 为主题配置的消息格式版本使用大于0的magic值，且
+          // 2. 消息集中包含magic > 0的消息
+          // 这是为了尽可能减少消息格式转换。只有当主题使用新消息格式且我们看到旧请求时才会发生转换。
+          // 请注意，如果消息格式从较高版本改回较低版本，此测试可能会失败，因为某些新消息格式的消息可以在0.10.0.0之前
+          // 无需格式降级就传递给消费者。
           val convertedData = if (versionId <= 1 && replicaManager.getMagic(tp).exists(_ > Record.MAGIC_VALUE_V0) &&
             !data.records.hasMatchingShallowMagic(Record.MAGIC_VALUE_V0)) {
             trace(s"Down converting message to V0 for fetch request from $clientId")
@@ -497,12 +548,14 @@ class KafkaApis(val requestChannel: RequestChannel,
           tp -> new FetchResponse.PartitionData(convertedData.error.code, convertedData.hw, convertedData.records)
         }
       }
-
+      // 9. 合并所有分区的响应数据（正常数据 + 各类错误数据）
       val mergedPartitionData = convertedPartitionData ++ unauthorizedForReadPartitionData ++ nonExistingOrUnauthorizedForDescribePartitionData ++ clusterUnauthorizedPartitionData
 
+      // 10. 创建有序的响应分区数据映射（LinkedHashMap保证插入顺序，与请求顺序一致）
       val fetchedPartitionData = new util.LinkedHashMap[TopicPartition, FetchResponse.PartitionData]()
 
       mergedPartitionData.foreach { case (topicPartition, data) =>
+        // 11. 若分区有错误，输出调试日志（包含错误原因）
         if (data.errorCode != Errors.NONE.code)
           debug(s"Fetch request with correlation id ${request.header.correlationId} from client $clientId " +
             s"on partition $topicPartition failed due to ${Errors.forCode(data.errorCode).exceptionName}")
@@ -510,12 +563,14 @@ class KafkaApis(val requestChannel: RequestChannel,
         fetchedPartitionData.put(topicPartition, data)
 
         // record the bytes out metrics only when the response is being sent
+        // 记录消息发送的字节数指标（按主题和全局统计）
         BrokerTopicStats.getBrokerTopicStats(topicPartition.topic).bytesOutRate.mark(data.records.sizeInBytes)
         BrokerTopicStats.getBrokerAllTopicsStats().bytesOutRate.mark(data.records.sizeInBytes)
       }
 
       val response = new FetchResponse(versionId, fetchedPartitionData, 0)
 
+      // 12. 发送响应的回调函数（支持延迟发送，用于配额限流）
       def fetchResponseCallback(delayTimeMs: Int) {
         trace(s"Sending fetch response to client $clientId of " +
           s"${convertedPartitionData.map { case (_, v) => v.records.sizeInBytes }.sum} bytes")
@@ -524,10 +579,13 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       // When this callback is triggered, the remote API call has completed
+      // 记录远程API调用完成时间（用于监控耗时）
       request.apiRemoteCompleteTimeMs = time.milliseconds
 
+      // 14. 根据请求来源（follower或consumer）处理配额和限流
       if (fetchRequest.isFromFollower) {
         // We've already evaluated against the quota and are good to go. Just need to record it now.
+        // 我们已经评估过配额并且可以继续。现在只需要记录它。
         val responseSize = sizeOfThrottledPartitions(versionId, fetchRequest, mergedPartitionData, quotas.leader)
         quotas.leader.record(responseSize)
         fetchResponseCallback(0)
@@ -536,10 +594,12 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // 15. 如果没有授权请求的信息，直接发送空响应
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Seq.empty)
     else {
       // call the replica manager to fetch messages from the local replica
+      // 16. 调用副本管理器从本地副本获取消息
       replicaManager.fetchMessages(
         fetchRequest.maxWait.toLong,
         fetchRequest.replicaId,

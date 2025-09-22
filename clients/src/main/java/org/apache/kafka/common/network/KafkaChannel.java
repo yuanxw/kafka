@@ -91,12 +91,14 @@ public class KafkaChannel {
 
     public void mute() {
         if (!disconnected)
+            // 对当前连接移除读事件OP_READ
             transportLayer.removeInterestOps(SelectionKey.OP_READ);
         muted = true;
     }
 
     public void unmute() {
         if (!disconnected)
+            // 对当前连接添加读事件OP_READ
             transportLayer.addInterestOps(SelectionKey.OP_READ);
         muted = false;
     }

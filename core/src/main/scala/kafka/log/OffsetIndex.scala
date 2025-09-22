@@ -76,19 +76,28 @@ class OffsetIndex(file: File, baseOffset: Long, maxIndexSize: Int = -1)
   /**
    * Find the largest offset less than or equal to the given targetOffset 
    * and return a pair holding this offset and its corresponding physical file position.
-   * 
+   *
+   * 查找小于或等于给定目标偏移量的最大偏移量，
+   * 并返回包含此偏移量及其对应物理文件位置的配对。
    * @param targetOffset The offset to look up.
    * @return The offset found and the corresponding file position for this offset
    *         If the target offset is smaller than the least entry in the index (or the index is empty),
    *         the pair (baseOffset, 0) is returned.
    */
   def lookup(targetOffset: Long): OffsetPosition = {
+    // 在可能加锁的情况下执行查找操作
     maybeLock(lock) {
+      // 复制内存映射缓冲区以避免并发修改问题
       val idx = mmap.duplicate
+
+      // 使用二分查找在索引中查找目标偏移量的槽位
       val slot = indexSlotFor(idx, targetOffset, IndexSearchType.KEY)
+
+      // 如果未找到合适的槽位（返回-1），返回基础偏移量和位置0
       if(slot == -1)
         OffsetPosition(baseOffset, 0)
       else
+        // 解析找到的槽位中的条目，并转换为OffsetPosition类型
         parseEntry(idx, slot).asInstanceOf[OffsetPosition]
     }
   }
@@ -117,18 +126,39 @@ class OffsetIndex(file: File, baseOffset: Long, maxIndexSize: Int = -1)
 
   /**
    * Append an entry for the given offset/location pair to the index. This entry must have a larger offset than all subsequent entries.
+   * 向索引中追加一个给定偏移量(offset)/位置(position)对的条目。
+   * 这个条目的偏移量必须比之前所有已追加条目的偏移量都大（即保持严格递增）。
+   *
+   * @param offset 消息的绝对偏移量
+   * @param position 消息在日志文件中的物理位置（字节偏移量）
    */
   def append(offset: Long, position: Int) {
+    // 使用锁进行同步，确保索引写入操作的线程安全，避免多线程并发修改导致索引数据错乱
     inLock(lock) {
+      // 1. 检查索引是否已满，如果已满则抛出异常
       require(!isFull, "Attempt to append to a full index (size = " + _entries + ").")
+
+      // 2. 检查偏移量是否有效：索引为空 或 新偏移量大于最后记录的偏移量
+      // 这是Kafka索引有序性的核心保证，只有有序才能支持二分查找等高效查询
       if (_entries == 0 || offset > _lastOffset) {
         debug("Adding index entry %d => %d to %s.".format(offset, position, file.getName))
+
+        // 3. 将相对偏移量（相对于基础偏移量baseOffset）写入内存映射文件，使用toInt转换，因为索引中存储的是4字节的相对偏移量
         mmap.putInt((offset - baseOffset).toInt)
+
+        // 4. 将物理位置信息写入内存映射文件
         mmap.putInt(position)
+
+        // 5. 更新条目计数器
         _entries += 1
+
+        // 6. 更新最后记录的偏移量
         _lastOffset = offset
+
+        // 7. 验证一致性：确保写入的文件位置与预期相符，每个索引条目占用8字节（4字节相对偏移量 + 4字节物理位置）
         require(_entries * entrySize == mmap.position, entries + " entries but file position in index is " + mmap.position + ".")
       } else {
+        // 8. 如果尝试追加的偏移量不大于最后记录的偏移量，抛出异常。这确保了索引中的偏移量始终保持严格递增的顺序
         throw new InvalidOffsetException("Attempt to append an offset (%d) to position %d no larger than the last offset appended (%d) to %s."
           .format(offset, entries, _lastOffset, file.getAbsolutePath))
       }

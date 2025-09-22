@@ -255,11 +255,14 @@ public class NetworkClient implements KafkaClient {
 
     /**
      * Queue up the given request for sending. Requests can only be sent out to ready nodes.
-     * @param request The request
-     * @param now The current timestamp
+     * 将给定请求加入发送队列。请求只能发送到已就绪的节点。
+     *
+     * @param request The request          要发送的请求
+     * @param now The current timestamp   当前时间戳
      */
     @Override
     public void send(ClientRequest request, long now) {
+        // 调用内部发送方法，标记为非内部请求
         doSend(request, false, now);
     }
 
@@ -269,7 +272,15 @@ public class NetworkClient implements KafkaClient {
         doSend(clientRequest, true, now);
     }
 
+    /**
+     * 实际执行发送请求的内部方法
+     *
+     * @param clientRequest 客户端请求
+     * @param isInternalRequest 是否为内部请求
+     * @param now 当前时间戳
+     */
     private void doSend(ClientRequest clientRequest, boolean isInternalRequest, long now) {
+        // 获取目标节点ID
         String nodeId = clientRequest.destination();
         if (!isInternalRequest) {
             // If this request came from outside the NetworkClient, validate
@@ -278,6 +289,10 @@ public class NetworkClient implements KafkaClient {
             // will be slightly different for some internal requests (for
             // example, ApiVersionsRequests can be sent prior to being in
             // READY state.)
+
+            // 如果此请求来自NetworkClient外部，验证我们是否可以发送数据。
+            // 如果是内部请求，我们信任内部代码已经完成了此验证。
+            // 对于某些内部请求，验证会略有不同（例如，ApiVersionsRequests可以在READY状态之前发送）。
             if (!canSendRequest(nodeId))
                 throw new IllegalStateException("Attempt to send a request to node " + nodeId + " which is not ready.");
         }
@@ -288,29 +303,46 @@ public class NetworkClient implements KafkaClient {
             // Note: if versionInfo is null, we have no server version information. This would be
             // the case when sending the initial ApiVersionRequest which fetches the version
             // information itself.  It is also the case when discoverBrokerVersions is set to false.
+
+            // 注意：如果versionInfo为null，表示我们没有服务器版本信息。
+            // 这可能在发送初始ApiVersionRequest时发生（该请求本身用于获取版本信息）。
+            // 当discoverBrokerVersions设置为false时也会发生这种情况。
             if (versionInfo == null) {
                 if (discoverBrokerVersions && log.isTraceEnabled())
                     log.trace("No version information found when sending message of type {} to node {}. " +
                             "Assuming version {}.", clientRequest.apiKey(), nodeId, builder.version());
             } else {
+                // 获取可用的API版本，并设置请求版本
                 short version = versionInfo.usableVersion(clientRequest.apiKey());
                 builder.setVersion(version);
             }
             // The call to build may also throw UnsupportedVersionException, if there are essential
             // fields that cannot be represented in the chosen version.
+
+            // build调用也可能抛出UnsupportedVersionException，如果在选择的版本中无法表示必需字段
             request = builder.build();
         } catch (UnsupportedVersionException e) {
             // If the version is not supported, skip sending the request over the wire.
             // Instead, simply add it to the local queue of aborted requests.
+
+            // 如果版本不受支持，跳过通过网络发送请求。而是简单地将其添加到本地中止请求队列中。
             log.debug("Version mismatch when attempting to send {} to {}",
                     clientRequest.toString(), clientRequest.destination(), e);
+
+            // 创建客户端响应表示版本不匹配错误
             ClientResponse clientResponse = new ClientResponse(clientRequest.makeHeader(),
                     clientRequest.callback(), clientRequest.destination(), now, now,
                     false, e, null);
+
+            // 添加到中止发送队列,直接返回，不发送请求
             abortedSends.add(clientResponse);
             return;
         }
+
+        // 创建请求头
         RequestHeader header = clientRequest.makeHeader();
+
+        // 记录调试日志
         if (log.isDebugEnabled()) {
             int latestClientVersion = ProtoUtils.latestVersion(clientRequest.apiKey().id);
             if (header.apiVersion() == latestClientVersion) {
@@ -320,17 +352,23 @@ public class NetworkClient implements KafkaClient {
                     header.apiVersion(), request, nodeId);
             }
         }
+
+        // 将请求转换为可发送格式
         Send send = request.toSend(nodeId, header);
         InFlightRequest inFlightRequest = new InFlightRequest(
-                header,
-                clientRequest.createdTimeMs(),
-                clientRequest.destination(),
-                clientRequest.callback(),
-                clientRequest.expectResponse(),
-                isInternalRequest,
-                send,
-                now);
+                header,                                         // 请求头
+                clientRequest.createdTimeMs(),                  // 请求创建时间
+                clientRequest.destination(),                    // 目标节点
+                clientRequest.callback(),                       // 请求回调
+                clientRequest.expectResponse(),                 // 是否期望响应
+                isInternalRequest,                              // 是否为内部请求
+                send,                                           // 发送请求
+                now);                                           // 当前时间戳
+
+        // 将请求加入到发送队列
         this.inFlightRequests.add(inFlightRequest);
+
+        // 通过选择器发送请求
         selector.send(inFlightRequest.send);
     }
 

@@ -230,26 +230,62 @@ class ReplicaFetcherThread(name: String,
     delayPartitions(partitions, brokerConfig.replicaFetchBackoffMs.toLong)
   }
 
+  /**
+   * 发送拉取请求并获取处理后的响应数据。
+   * 该方法是拉取操作的网络交互核心，负责将构建好的拉取请求发送到leader broker，
+   * 并将返回的响应数据转换为上层处理所需的格式（主题分区与对应分区数据的映射）。
+   *
+   * @param fetchRequest 已构建的拉取请求对象（包含待拉取的分区及偏移量等信息）
+   * @return 拉取到的结果序列，每个元素为（主题分区 -> 分区数据）的键值对，
+   *         其中分区数据包含实际的日志记录、高水位等信息
+   */
   protected def fetch(fetchRequest: FetchRequest): Seq[(TopicPartition, PartitionData)] = {
+    // 1. 发送底层抓取请求并获取客户端响应
     val clientResponse = sendRequest(fetchRequest.underlying)
+
+    // 2. 将响应体转换为fetchResponse类型
     val fetchResponse = clientResponse.responseBody.asInstanceOf[FetchResponse]
+
+    // 3. 将响应中的数据（Java集合）转换为Scala序列，并映射为（TopicPartition -> PartitionData）格式：
+      // 3.1. responseData.asScala：将Java的Map转换为Scala的Map，便于后续处理
+      // 3.2. toSeq：转换为序列，保持元素顺序
+      // 3.3. map：将每个键值对中的值（原始响应数据）包装为PartitionData对象（上层处理期望的类型）
     fetchResponse.responseData.asScala.toSeq.map { case (key, value) =>
       key -> new PartitionData(value)
     }
   }
 
+  /**
+   * 发送请求并获取对应的响应。
+   * 该方法是网络请求发送的核心实现，负责通过网络客户端与目标broker建立连接、发送请求并接收响应，
+   * 同时处理连接超时和异常情况，确保请求的可靠传输。
+   *
+   * @param requestBuilder 请求构建器，用于创建具体的请求对象（包含请求类型、参数等信息）
+   * @return 从broker接收到的客户端响应（包含响应体和元数据）
+   */
   private def sendRequest(requestBuilder: AbstractRequest.Builder[_ <: AbstractRequest]): ClientResponse = {
+    // 导入网络客户端的阻塞操作扩展方法
     import kafka.utils.NetworkClientBlockingOps._
+
     try {
+      // 检查与源节点（sourceNode）的连接是否在超时时间内就绪
+      // 若未就绪（返回false），则抛出SocketTimeoutException
       if (!networkClient.blockingReady(sourceNode, socketTimeout)(time))
         throw new SocketTimeoutException(s"Failed to connect within $socketTimeout ms")
       else {
-        val clientRequest = networkClient.newClientRequest(sourceBroker.id.toString, requestBuilder,
-          time.milliseconds(), true)
+        // 创建客户端请求：指定目标broker ID、请求构建器、创建时间戳，标记为需要响应
+        val clientRequest = networkClient.newClientRequest(
+          sourceBroker.id.toString,  // 目标broker的标识
+          requestBuilder,            // 请求构建器
+          time.milliseconds(),       // 创建时间戳
+          true                       // 需要等待响应
+        )
+        // 阻塞式发送请求并接收响应（通过扩展方法实现，内部包含轮询逻辑）
         networkClient.blockingSendAndReceive(clientRequest)(time)
       }
     }
     catch {
+      // 捕获所有异常，关闭与该broker的连接后重新抛出异常
       case e: Throwable =>
         networkClient.close(sourceBroker.id.toString)
         throw e

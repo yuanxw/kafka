@@ -266,18 +266,28 @@ public class Selector implements Selectable {
 
     /**
      * Queue the given request for sending in the subsequent {@link #poll(long)} calls
-     * @param send The request to send
+     * 将给定请求加入队列，以便在后续的{@link #poll(long)}调用中发送
+     *
+     * @param send The request to send  要发送的请求
      */
     public void send(Send send) {
+        // 获取请求的目标连接ID
         String connectionId = send.destination();
+        // 检查该连接是否正在关闭
         if (closingChannels.containsKey(connectionId))
+            // 如果连接正在关闭，将连接ID添加到失败发送列表
             this.failedSends.add(connectionId);
         else {
+            // 获取对应的Kafka通道，如果不存在则抛出异常
             KafkaChannel channel = channelOrFail(connectionId, false);
             try {
+                // 设置通道的发送请求
                 channel.setSend(send);
             } catch (CancelledKeyException e) {
+                // 如果发生CancelledKeyException（通常表示通道已关闭或取消注册）
+                // 将连接添加到失败发送列表
                 this.failedSends.add(connectionId);
+                // 关闭通道，第二个参数false表示不立即通知
                 close(channel, false);
             }
         }

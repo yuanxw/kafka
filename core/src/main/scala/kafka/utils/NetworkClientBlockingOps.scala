@@ -102,19 +102,38 @@ class NetworkClientBlockingOps(val client: NetworkClient) extends AnyVal {
    *
    * This method is useful for implementing blocking behaviour on top of the non-blocking `NetworkClient`, use it with
    * care.
+   *
+   * 先调用`client.send`发送请求，然后通过1次或多次`client.poll`调用轮询，直到收到响应或连接断开
+   * （连接断开可能由多种原因导致，包括请求超时）。
+   *
+   * 若发生连接断开，将抛出`IOException`。
+   *
+   * 该方法用于在非阻塞的`NetworkClient`基础上实现阻塞行为，使用时需谨慎（避免过度阻塞影响性能）。
+   *
+   * @param request 待发送的客户端请求对象
+   * @param time 时间工具类，用于获取当前时间
+   * @return 从服务器接收到的响应对象
    */
   def blockingSendAndReceive(request: ClientRequest)(implicit time: Time): ClientResponse = {
+    // 发送请求到目标节点，参数为当前时间戳（用于计算超时）
     client.send(request, time.milliseconds())
+
+    // 持续轮询直到获取目标响应
     pollContinuously { responses =>
+      // 在响应集合中查找与请求关联ID匹配的响应
       val response = responses.find { response =>
         response.requestHeader.correlationId == request.correlationId
       }
+      // 若找到匹配的响应，检查是否发生断开连接或版本不匹配
       response.foreach { r =>
+        // 连接已断开时抛出异常
         if (r.wasDisconnected)
           throw new IOException(s"Connection to ${request.destination} was disconnected before the response was read")
         else if (r.versionMismatch() != null)
+          // 协议版本不匹配时抛出异常（通常是客户端与broker版本不兼容）
           throw r.versionMismatch();
       }
+      // 返回找到的响应（若未找到则继续轮询）
       response
     }
   }
